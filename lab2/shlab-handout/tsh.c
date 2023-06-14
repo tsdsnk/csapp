@@ -168,17 +168,19 @@ void eval(char *cmdline)
 {
     char * argv[MAXARGS];
     char buf[MAXLINE];
-    
+    // 缓存命令行，并解析
     strcpy(buf, cmdline);
     int bg = parseline(cmdline, argv);
     
     int pid;
 
+    // 是否为空行
     if(argv[0] == NULL){
         return;
-    }else if(!builtin_cmd(argv)){
+    }else if(!builtin_cmd(argv)){   // 是否为内置命令，不是则调用文件执行
 
         sigset_t mask, prev_mask;
+        // 设置mask屏蔽SIGCHLD,SIGINT,SIGTSTP
         if(sigemptyset(&mask) < 0){
             unix_error("eval: sigemptyset");
         }
@@ -196,33 +198,40 @@ void eval(char *cmdline)
             unix_error("eval: set mask");
         }
 
-
+        // 创建子进程执行
         if((pid = fork()) == 0){
+            // 子进程，恢复全部的信号屏蔽设置
             sigprocmask(SIG_UNBLOCK, &mask, NULL);
+            // 设置为独立的进程组
             if(setpgid(0, 0) < 0){
                 unix_error("eval: setpgid");
             }
+            // 加载程序并执行
             if(execve(argv[0], argv, environ) < 0){
                 printf("%s: command not found\n", argv[0]);
                 exit(0);
             }
         }else if(pid > 0){
+            // shell进程
+            // 屏蔽全部信号以访问共享变量jobs
             if(sigfillset(&mask) < 0){
                 unix_error("eval: sigfillmask");
             }
             if(sigprocmask(SIG_SETMASK, &mask, NULL) < 0){
                 unix_error("eval: parent setmask (all)");
             }  
-            
+            // 添加新作业
             addjob(jobs, pid, (bg?BG:FG), cmdline);
+            // 恢复屏蔽位
             if(sigprocmask(SIG_SETMASK, &prev_mask, NULL) < 0){
                 unix_error("eval: parent unset mask");
             }
             
             if(bg){
+                // 后台作业打印消息
                 printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
-                
             }else{
+                // 前台作业等待
                 waitfg(pid);
             }
         }else{
@@ -298,28 +307,33 @@ int parseline(const char *cmdline, char **argv)
 int builtin_cmd(char **argv) 
 {
     sigset_t mask, prev_mask;
-    if(sigfillset(&mask) < 0){
-        unix_error("builtin_cmd: fill mask");
-    }
+    // 分别匹配 "quit", "&", "fg", "bg", "jobs"并处理
     if(strcmp(argv[0], "quit") == 0){
+        // 退出shell进程
         exit(0);
     }else if(strcmp(argv[0], "&") == 0){
+        // 后台进程
         return 1;
     }    
     else if(strcmp(argv[0], "fg") == 0){
-        // TODO
+        // 交由do_bgfg处理
         do_bgfg(argv);
         return 1;
     }else if(strcmp(argv[0], "bg") == 0){
-        // TODO
+        // 交由do_bgfg处理
         do_bgfg(argv);
         return 1;
     }else if(strcmp(argv[0], "jobs") == 0){
-        // TODO
+        // 屏蔽全部信号访问共享变量
+        if(sigfillset(&mask) < 0){
+            unix_error("builtin_cmd: fill mask");
+        }
         if(sigprocmask(SIG_BLOCK, &mask, &prev_mask) < 0){
             unix_error("buildin_cmd: set mask");
         }
+        // 打印消息
         listjobs(jobs);
+        // 恢复信号屏蔽位
         if(sigprocmask(SIG_SETMASK, &prev_mask, NULL) < 0){
             unix_error("buildin_cmd: unset mask");
         }
@@ -334,18 +348,23 @@ int builtin_cmd(char **argv)
  */
 void do_bgfg(char **argv) 
 {
+    // 检查参数是否存在
     if(argv[1] == NULL){
         printf("%s command requires PID or %%jobid argument\n", argv[0]);
         return;
     }
     struct job_t* job = NULL;
+
+    // 根据参数获取job结构体
    if (isdigit(argv[1][0])) {
+      // 应为 bg/fg + pid 格式
       pid_t pid = atoi(argv[1]); 
       if (!(job = getjobpid(jobs, pid))){
           printf("(%d): No such process\n", pid);
           return;
       }
     }else if (argv[1][0] == '%') {
+      // 应为bg/fg + %jid 格式 
       int jid = atoi(&argv[1][1]);
       if (!(job = getjobjid(jobs, jid))){
           printf("%s: No such job\n", argv[1]);
@@ -355,18 +374,22 @@ void do_bgfg(char **argv)
       printf("%s: argument must be a PID or %%jobid\n", argv[0]);
       return;
     }
+
+
     if(strcmp(argv[0], "bg") == 0){
-        // TODO
+        // 向任务发生信号SIGCONT
         if(kill(-(job->pid), SIGCONT) < 0){
             unix_error("do_bgfg: kill");
         }
         job->state = BG;
         printf("[%d] (%d) %s", job->jid, job->pid, job->cmdline);
     }else if(strcmp(argv[0], "fg") == 0){
+        // 向任务发送信号SIGCONT
         if(kill(-(job->pid), SIGCONT) < 0){
             unix_error("do_bgfg: kill");
         }
         job->state = FG;
+        // 等待任务结束
         waitfg(job->pid);
     }
     
@@ -379,10 +402,13 @@ void do_bgfg(char **argv)
 void waitfg(pid_t pid)
 {
     sigset_t mask;
+    // 清空信号阻塞位
     if(sigemptyset(&mask) < 0){
         unix_error("waitfg: empty mask");
     }
+    // 若为前台进程
     while(pid == fgpid(jobs)){
+        // 阻塞直至收到(sigchld)信号
         sigsuspend(&mask);
     }
     return;
@@ -410,20 +436,25 @@ void sigchld_handler(int sig)
     pid_t pid;
     int status;
 
+    // 检查是否有僵尸进程(waitpid会立即返回)
     while((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0){
         sigprocmask(SIG_BLOCK, &mask, &prev_mask);
         job = getjobpid(jobs, pid);
         if(job == NULL){
-            unix_error("sigchld: unkown pid ");
+            // unix_error("sigchld: unkown pid ");
+            return;
         }
         if(WIFSTOPPED(status)){
+            // 子进程停止
             job->state = ST;
             printf("Job [%d] (%d) stopped by signal %d\n",job->jid,job->pid,WSTOPSIG(status));
 
         }else{
+            // 子进程终止
             if(WIFSIGNALED(status)){
                 printf("Job [%d] (%d) terminated by signal %d\n",job->jid,job->pid,WTERMSIG(status));
             }
+            //回进程
             deletejob(jobs, pid);
         }
         fflush(stdout);
@@ -447,18 +478,20 @@ void sigint_handler(int sig)
     sigset_t mask, prev_mask;
     pid_t pid;
 
+    // 访问共享变量，设置信号位
     if(sigfillset(&mask) < 0){
         unix_error("sigint: fill set");
     }
     if(sigprocmask(SIG_BLOCK,&mask,&prev_mask) < 0){
         unix_error("sigint: set mask");
     }
-    
+    // 获取pid
     pid = fgpid(jobs);
-
+    // 恢复信号位
     if(sigprocmask(SIG_SETMASK, &prev_mask, NULL) < 0){
         unix_error("sigint: unset mask");
     }
+    // 向进程发送^C
     if(pid!= 0){
         if(kill(-pid,SIGINT) < 0){
             unix_error("sigint: send sigint");
@@ -477,18 +510,20 @@ void sigtstp_handler(int sig)
 {
     pid_t pid;
     sigset_t mask,prev_mask;
-
+    // 访问共享变量，设置信号位
     if(sigfillset(&mask) < 0){
         unix_error("sigtstp: fill set");
     }
     if(sigprocmask(SIG_BLOCK,&mask,&prev_mask) < 0){
         unix_error("sigtstp: set mask");
     }
+    // 获取pid
     pid = fgpid(jobs);
+    // 恢复信号位
     if(sigprocmask(SIG_SETMASK,&prev_mask,NULL) < 0){
         unix_error("sigtstp: unset mask");
     }
-
+    // 发送信号
     if(pid!=0){
         if(kill(-pid,SIGTSTP) < 0){
             unix_error("sigtstp: send sigtstp");
